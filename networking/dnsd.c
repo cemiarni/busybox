@@ -53,10 +53,14 @@ enum {
 
 	/* cannot get bigger packets than 512 per RFC1035. */
 	MAX_PACK_LEN = 512,
-	IP_STRING_LEN = sizeof(".xxx.xxx.xxx.xxx"),
-	MAX_NAME_LEN = IP_STRING_LEN - 1 + sizeof(".in-addr.arpa"),
+    IP_STRING_MAX_LEN = 40 * sizeof(char), /* size of IPv6 address */
+    /* the length of the reversed IPv6 address with postfix and 0 terminator */
+    RIP_STRING_MAX_LEN = 74 * sizeof(char),
 	REQ_A = 1,
+    REC_A = 1,
 	REQ_PTR = 12,
+    REQ_AAAA = 28,
+    REC_AAAA = 28,
 };
 
 /* the message from client and first part of response msg */
@@ -77,11 +81,18 @@ struct type_and_class {
 	uint16_t type PACKED;
 	uint16_t class PACKED;
 } PACKED;
+
+typedef union {
+    struct in_addr ipv4;
+    struct in6_addr ipv6;
+} ip_t;
+
 /* element of known name, ip address and reversed ip address */
 struct dns_entry {
 	struct dns_entry *next;
-	uint32_t ip;
-	char rip[IP_STRING_LEN]; /* length decimal reversed IP */
+    uint8_t type;
+    ip_t ip;
+    char rip[RIP_STRING_MAX_LEN]; /* length decimal reversed IP */
 	char name[1];
 };
 
@@ -110,6 +121,50 @@ static void undot(char *rip)
 }
 
 /*
+ * Make reversed IP
+ */
+static void make_rip(struct dns_entry* dns_entry)
+{
+    uint8_t* bytes = (uint8_t*)&dns_entry->ip;
+    bool is_ipv6 = dns_entry->type == REC_AAAA;
+
+    if (is_ipv6) {
+        for (int i = 0, j = 15; j >= 0; --j, i += 4) {
+            sprintf(dns_entry->rip + i, ".%x.%x",
+            bytes[j] & 0x0F, bytes[j] >> 4);
+        }
+        strcat(dns_entry->rip, ".ip6.arpa");
+    }
+    else {
+        sprintf(dns_entry->rip, ".%u.%u.%u.%u",
+            bytes[3],
+            bytes[2],
+            bytes[1],
+            bytes[0]
+        );
+        strcat(dns_entry->rip, ".in-addr.arpa");
+    }
+    undot(dns_entry->rip);
+}
+
+
+#if DEBUG
+    static void debug_print_ip(
+        FILE* output, const char* msg_prefix, const struct dns_entry* dns_entry)
+    {
+        bool is_ipv6 = dns_entry->type == REC_AAAA;
+        char ip_string[IP_STRING_MAX_LEN]="";
+        int af = is_ipv6 ? AF_INET6 : AF_INET;
+
+        inet_ntop(af, &dns_entry->ip, ip_string, IP_STRING_MAX_LEN);
+        fprintf(output, msg_prefix);
+        fprintf(output, "%s\n", ip_string);
+    }
+#else
+    #define debug_print_ip(output, msg_prefix, dns_entry)
+#endif
+
+/*
  * Read hostname/IP records from file
  */
 static struct dns_entry *parse_conf_file(const char *fileconf)
@@ -124,19 +179,23 @@ static struct dns_entry *parse_conf_file(const char *fileconf)
 
 	parser = config_open(fileconf);
 	while (config_read(parser, token, 2, 2, "# \t", PARSE_NORMAL)) {
-		struct in_addr ip;
-		uint32_t v32;
+    ip_t ip;
+    bool is_ipv6 = false;
 
-		if (inet_aton(token[1], &ip) == 0) {
-			bb_error_msg("error at line %u, skipping", parser->lineno);
-			continue;
-		}
+    if (inet_pton(AF_INET, token[1], &ip) <= 0) { /* not IPv4 */
+        if (inet_pton(AF_INET6, token[1], &ip) <= 0) { /* not IPv6 */
+            bb_error_msg("error at line %u, skipping", parser->lineno);
+            continue;
+        }
+        else
+            is_ipv6 = true;
+        }
 
 		if (OPT_verbose)
 			bb_info_msg("name:%s, ip:%s", token[0], token[1]);
 
 		/* sizeof(*m) includes 1 byte for m->name[0] */
-		m = xzalloc(sizeof(*m) + strlen(token[0]) + 1);
+		m = xzalloc(sizeof(*m) + strlen(token[0]) + 2);
 		/*m->next = NULL;*/
 		*nextp = m;
 		nextp = &m->next;
@@ -144,16 +203,9 @@ static struct dns_entry *parse_conf_file(const char *fileconf)
 		m->name[0] = '.';
 		strcpy(m->name + 1, token[0]);
 		undot(m->name);
-		m->ip = ip.s_addr; /* in network order */
-		v32 = ntohl(m->ip);
-		/* inverted order */
-		sprintf(m->rip, ".%u.%u.%u.%u",
-			(uint8_t)(v32),
-			(uint8_t)(v32 >> 8),
-			(uint8_t)(v32 >> 16),
-			(v32 >> 24)
-		);
-		undot(m->rip);
+        m->ip = ip; /* in network order */
+        m->type = is_ipv6 ? REC_AAAA : REC_A;
+        make_rip(m);
 	}
 	config_close(parser);
 	return conf_data;
@@ -164,11 +216,17 @@ static struct dns_entry *parse_conf_file(const char *fileconf)
  */
 static char *table_lookup(struct dns_entry *d,
 		uint16_t type,
-		char* query_string)
+        char* query_string,
+        bool* hit)
 {
+    *hit = false;
 	while (d) {
 		unsigned len = d->name[0];
 		/* d->name[len] is the last (non NUL) char */
+        bool matching_request_record_type =
+            (type == htons(REQ_A) && d->type == REC_A)
+            || (type == htons(REQ_AAAA) && d->type == REC_AAAA);
+        bool name_matched;
 #if DEBUG
 		char *p, *q;
 		q = query_string + 1;
@@ -178,7 +236,7 @@ static char *table_lookup(struct dns_entry *d,
 			p, q, (int)strlen(q)
 		);
 #endif
-		if (type == htons(REQ_A)) {
+        if (type == htons(REQ_A) || type == htons(REQ_AAAA)) {
 			/* search by host name */
 			if (len != 1 || d->name[1] != '*') {
 /* we are lax, hope no name component is ever >64 so that length
@@ -190,24 +248,28 @@ static char *table_lookup(struct dns_entry *d,
  * [65+32]<65 same chars>1   <31 same chars>NUL
  * This example seems to be the minimal case when false match occurs.
  */
-				if (strcasecmp(d->name, query_string) != 0)
+                name_matched = strcasecmp(d->name, query_string) == 0;
+                if (name_matched) *hit = true;
+                if (name_matched == false
+                    || (name_matched && matching_request_record_type == false))
 					goto next;
 			}
-			return (char *)&d->ip;
-#if DEBUG
-			fprintf(stderr, "Found IP:%x\n", (int)d->ip);
-#endif
-			return 0;
+            *hit = true;
+            if (matching_request_record_type) {
+                debug_print_ip(stderr, "Found IP: ", d);
+                return (char *)&d->ip;
+            }
+            return NULL;
 		}
 		/* search by IP-address */
+        printf("q: %s\np: %s\n", query_string, d->rip);
 		if ((len != 1 || d->name[1] != '*')
-		/* we assume (do not check) that query_string
-		 * ends in ".in-addr.arpa" */
-		 && is_prefixed_with(query_string, d->rip)
+		 && strcasecmp(query_string, d->rip) == 0
 		) {
 #if DEBUG
 			fprintf(stderr, "Found name:%s\n", d->name);
 #endif
+            *hit = true;
 			return d->name;
 		}
  next:
@@ -311,7 +373,7 @@ QTYPE   a two octet type of the query.
          14 mailbox or mail list information
          15 mail exchange
          16 text strings
-       0x1c IPv6?
+         28 IPv6 [REQ_AAAA const]
         252 a request for a transfer of an entire zone
         253 a request for mailbox-related records (MB, MG or MR)
         254 a request for mail agent RRs (Obsolete - see MX)
@@ -392,6 +454,7 @@ static int process_packet(struct dns_entry *conf_data,
 	uint16_t type;
 	uint16_t class;
 	int query_len;
+    bool hit;
 
 	head = (struct dns_head *)buf;
 	if (head->nquer == 0) {
@@ -427,20 +490,25 @@ static int process_packet(struct dns_entry *conf_data,
 		goto empty_packet;
 	}
 	move_from_unaligned16(type, &unaligned_type_class->type);
-	if (type != htons(REQ_A) && type != htons(REQ_PTR)) {
+	if (type != htons(REQ_A)
+        && type != htons(REQ_PTR)
+        && type != htons(REQ_AAAA)) {
 		/* we can't handle this query type */
-//TODO: happens all the time with REQ_AAAA (0x1c) requests - implement those?
-		err_msg = "type is !REQ_A and !REQ_PTR";
+        err_msg = "query type error occured, the supported types are: A, PTR or AAAA";
 		goto empty_packet;
 	}
 
 	/* look up the name */
-	answstr = table_lookup(conf_data, type, query_string);
+    answstr = table_lookup(conf_data, type, query_string, &hit);
 #if DEBUG
 	/* Shows lengths instead of dots, unusable for !DEBUG */
 	bb_info_msg("'%s'->'%s'", query_string, answstr);
 #endif
-	outr_rlen = 4;
+    if (hit == true && answstr == NULL) {
+        outr_flags = htons(0x8000 | 0x0400 | 0);
+        goto empty_packet;
+    }
+    outr_rlen = htons(REQ_AAAA) == type ? 16 : 4;
 	if (answstr && type == htons(REQ_PTR)) {
 		/* returning a host name */
 		outr_rlen = strlen(answstr) + 1;
